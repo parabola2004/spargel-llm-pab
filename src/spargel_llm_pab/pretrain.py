@@ -72,14 +72,14 @@ class PretrainerBase:
         self.save_period = save_period
         self.checkpoint_period = checkpoint_period
 
-        print("Loading model... ", end="")
+        print(f"Loading model state ({model_state_path})... ", end="")
         self.model = Model(model_config).to(device)
         self.model.load_state_dict(
             torch.load(model_state_path, weights_only=True, map_location=device)
         )
         print("loaded.")
 
-        print("Loading optimizer state... ", end="")
+        print(f"Loading optimizer state ({optimizer_state_path})... ", end="")
         self.optimizer = AdamW(self.model.parameters())
         if os.path.isfile(optimizer_state_path):
             self.optimizer.load_state_dict(torch.load(optimizer_state_path))
@@ -271,18 +271,19 @@ class PretrainerBase:
                         f", avg_time={avg_time:.4f}"
                     )
 
-            if self.step % self.save_period == 0:
+            if self.step % self.save_period == 0 and self.step != target_step:
                 self.save()
                 mask_ratio = sum_mask_true / sum_mask_total
                 print(f"mask_ratio={mask_ratio:.4f}")
                 sum_mask_true = 0
                 sum_mask_total = 0
 
-            if self.step % self.checkpoint_period == 0:
+            if self.step % self.checkpoint_period == 0 and self.step != target_step:
                 self.make_checkpoint()
                 if writer:
                     writer.close()
                     writer = SummaryWriter(self.tensorboard_dir)
+                    self.writer = writer
 
         self.save()
         self.make_checkpoint()
@@ -379,7 +380,7 @@ class Pretrainer(PretrainerBase):
         self.pretrain_state_path = pretrain_state_path
         self.loop_dataset = loop_dataset
 
-        print("Loading pretrain state... ", end="")
+        print(f"Loading pretrain state ({pretrain_state_path})... ", end="")
         with open(pretrain_state_path, "r") as f:
             self.state = PretrainState.model_validate_json(f.read())
         self.dataset_state = self.state.dataset.get(
@@ -487,13 +488,15 @@ class Pretrainer(PretrainerBase):
     @override
     def on_step_end(self):
         self.state.step = self.step + 1
-        self.state.dataset[self.dataset_name] = PretrainDatasetState(
+        self.dataset_state = PretrainDatasetState(
             group_index=self.data_iterator.group_index, offset=self.data_iterator.offset
         )
+        self.state.dataset[self.dataset_name] = self.dataset_state
 
     @override
     def on_data_exhausted(self):
-        self.state.dataset[self.dataset_name] = PretrainDatasetState()
+        self.dataset_state = PretrainDatasetState()
+        self.state.dataset[self.dataset_name] = self.dataset_state
 
 
 def estimate_memory(
@@ -664,22 +667,24 @@ def report_memory_estimate(
 
 
 def validate(
-    model_state_path: str,
+    model_config: Config,
     seq_len: int,
     batch_size: int,
     dataset_name: str,
     batches: int,
+    model_state_path: str,
     *,
     device: str,
-    model_config: Config,
     pad_id: int,
     sep_id: int,
     use_bf16: bool = True,
 ):
+    print(f"Loading model state ({model_state_path})... ", end="")
     model = Model(model_config).to(device)
     model.load_state_dict(
         torch.load(model_state_path, weights_only=True, map_location=device)
     )
+    print("loaded.")
 
     pf_val = ParquetFile(f"{dataset_name}_val.parquet")
     iterator_val = ParquetConcatIterator(pf_val, seq_len, pad_id=pad_id, sep_id=sep_id)
@@ -877,6 +882,9 @@ def cli(
 
             optimizer = AdamW(model.parameters())
             torch.save(optimizer.state_dict(), args.optimizer_state_path)
+
+            print("Initialization done.")
+
         case "generate":
             generate(
                 args.model_state_path,
@@ -890,6 +898,7 @@ def cli(
                 temperature=args.temperature,
                 use_bf16=use_bf16,
             )
+
         case "train":
             print(f"Sequence length: {seq_len}")
             print(f"Batch size: {batch_size}")
@@ -922,18 +931,19 @@ def cli(
                     tensorboard_dir=args.tensorboard_dir,
                 )
                 trainer.run(args.target_step)
+
         case "validate":
             print(f"Sequence length: {seq_len}")
             print(f"Batch size: {batch_size}")
 
             validate(
-                args.model_state_path,
+                model_config,
                 args.seq_len,
                 args.batch_size,
                 args.dataset_name,
                 args.batches,
+                args.model_state_path,
                 device=device,
-                model_config=model_config,
                 pad_id=pad_id,
                 sep_id=sep_id,
                 use_bf16=use_bf16,
