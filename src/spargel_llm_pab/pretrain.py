@@ -13,6 +13,7 @@ from typing import Any, override
 
 import torch
 from pyarrow.parquet import ParquetFile
+from pydantic import BaseModel
 from tokenizers import Tokenizer
 from tokenizers.decoders import DecodeStream
 from torch import Tensor
@@ -29,14 +30,24 @@ from spargel_llm.train.basic import (
 from spargel_llm.train.pretrain import ParquetConcatIterator
 from spargel_llm.utils import format_bytes, format_flops
 
-from .utils import (
-    LRFunc,
-    PretrainDatasetState,
-    PretrainState,
-    compute_param_counts,
-    next_batches,
-    setup,
-)
+from .utils import LRFunc, compute_param_counts, next_batches, setup, warn_bf16
+
+
+# also used in SFT
+class PretrainStatistics(BaseModel):
+    time: float = 0.0
+    tokens: int = 0
+
+
+class PretrainDatasetState(BaseModel):
+    group_index: int = 0
+    offset: int = 0
+
+
+class PretrainState(BaseModel):
+    step: int = 0
+    dataset: dict[str, PretrainDatasetState] = {}
+    statistics: PretrainStatistics = PretrainStatistics()
 
 
 class PretrainerBase:
@@ -77,13 +88,13 @@ class PretrainerBase:
         self.model.load_state_dict(
             torch.load(model_state_path, weights_only=True, map_location=device)
         )
-        print("loaded.")
+        print("ok.")
 
         print(f"Loading optimizer state ({optimizer_state_path})... ", end="")
         self.optimizer = AdamW(self.model.parameters())
         if os.path.isfile(optimizer_state_path):
             self.optimizer.load_state_dict(torch.load(optimizer_state_path))
-            print("loaded.")
+            print("ok.")
         else:
             print("state file not found, use fresh optimizer.")
 
@@ -91,10 +102,14 @@ class PretrainerBase:
 
         self.step = 0
 
+        self.statistics = PretrainStatistics()
+
         self.writer: SummaryWriter | None = None
 
     def run(self, target_step: int):
         t_start = time.perf_counter()
+
+        old_time = self.statistics.time
 
         if self.device == "cuda":
             torch.cuda.reset_peak_memory_stats()
@@ -165,8 +180,8 @@ class PretrainerBase:
         sum_loss = 0.0
         sum_perplexity = 0.0
         sum_time = 0.0
-        sum_mask_true = 0
-        sum_mask_total = 0
+        num_tokens_valid = 0
+        num_tokens_all = 0
 
         start_step = self.step
         for step in range(start_step, target_step):
@@ -202,8 +217,6 @@ class PretrainerBase:
             loss = loss.item()
             perplexity = math.exp(loss)
 
-            self.on_step_end()
-
             t_step_end = time.perf_counter()
             step_time = t_step_end - t_step_start
 
@@ -212,11 +225,17 @@ class PretrainerBase:
             sum_perplexity += perplexity
             sum_time += step_time
 
+            step_tokens_valid = sum(batch_data.num_valid)
+            num_tokens_valid += step_tokens_valid
+            num_tokens_all += batch_data.batches * self.batch_size * self.seq_len
+
             if writer:
                 writer.add_scalar("loss/train", loss, step)
                 writer.add_scalar("perplexity/train", perplexity, step)
                 writer.add_scalar("learning_rate", lr, step)
                 writer.add_scalar("metric/time/train", step_time, step)
+
+            self.on_step_end()
 
             self.step = step + 1
 
@@ -228,11 +247,6 @@ class PretrainerBase:
                 sum_perplexity = 0.0
                 sum_time = 0.0
                 count = 0
-
-                mask_true = batch_data.mask.sum().item()
-                mask_total = batch_data.mask.numel()
-                sum_mask_true += mask_true
-                sum_mask_total += mask_total
 
                 if self.val_batch_data is not None:
                     t_val_start = time.perf_counter()
@@ -271,25 +285,38 @@ class PretrainerBase:
                         f", avg_time={avg_time:.4f}"
                     )
 
+            t = time.perf_counter()
+            self.statistics.time = old_time + (t - t_start)
+            self.statistics.tokens += step_tokens_valid
+
+            if writer and self.step != target_step:
+                writer.add_scalar("statistics/tokens", self.statistics.tokens, step)
+                writer.add_scalar("statistics/time", self.statistics.time, step)
+
             if self.step % self.save_period == 0 and self.step != target_step:
                 self.save()
-                mask_ratio = sum_mask_true / sum_mask_total
-                print(f"mask_ratio={mask_ratio:.4f}")
-                sum_mask_true = 0
-                sum_mask_total = 0
+                valid_ratio = num_tokens_valid / num_tokens_all
+                print(f"valid_ratio={valid_ratio:.4f}")
+                num_tokens_valid = 0
+                num_tokens_all = 0
 
             if self.step % self.checkpoint_period == 0 and self.step != target_step:
                 self.make_checkpoint()
                 if writer:
                     writer.close()
-                    writer = SummaryWriter(self.tensorboard_dir)
-                    self.writer = writer
+                    self.writer = writer = SummaryWriter(self.tensorboard_dir)
+
+        t_end = time.perf_counter()
+        elapsed = t_end - t_start
+
+        self.statistics.time = old_time + elapsed
 
         self.save()
         self.make_checkpoint()
 
-        t_end = time.perf_counter()
-        elapsed = t_end - t_start
+        if writer:
+            writer.add_scalar("statistics/tokens", self.statistics.tokens, self.step)
+            writer.add_scalar("statistics/time", self.statistics.time, self.step)
 
         if self.device == "cuda":
             peak_allocated = torch.cuda.max_memory_allocated(self.device)
@@ -313,6 +340,7 @@ class PretrainerBase:
                 "id": str(run_id),
                 "time": datetime.now().astimezone().isoformat(),
                 "elapsed": round(elapsed, 6),
+                "statistics": self.statistics.model_dump(),
             }
             if self.device == "cuda":
                 end_info["cuda"] = {
@@ -372,6 +400,7 @@ class Pretrainer(PretrainerBase):
         loop_dataset: bool = True,
         use_bf16: bool = True,
         tensorboard_dir: str | None = None,
+        validation_batches: int = 10,
         log_period: int = 100,
         save_period: int = 1000,
         checkpoint_period: int = 4000,
@@ -386,9 +415,10 @@ class Pretrainer(PretrainerBase):
         self.dataset_state = self.state.dataset.get(
             dataset_name, PretrainDatasetState()
         )
-        print("loaded.")
+        print("ok.")
 
         # Prepare training data
+        print(f"Loading training dataset ({dataset_name}.parquet)... ", end="")
         pf_train = ParquetFile(f"{dataset_name}.parquet")
         data_iterator_train = ParquetConcatIterator(
             pf_train,
@@ -399,6 +429,7 @@ class Pretrainer(PretrainerBase):
             sep_id=sep_id,
             loop=loop_dataset,
         )
+        print("ok.")
 
         super().__init__(
             model_config,
@@ -421,18 +452,26 @@ class Pretrainer(PretrainerBase):
         self.data_iterator = data_iterator_train
 
         # Prepare validation data
+        print(f"Loading validation data ({dataset_name}_val.parquet)... ", end="")
         pf_val = ParquetFile(f"{dataset_name}_val.parquet")
         data_iterator_val = ParquetConcatIterator(
             pf_val, seq_len, pad_id=pad_id, sep_id=sep_id
         )
         self.val_batch_data = next_batches(
-            data_iterator_val, 10, batch_size, seq_len, pad_id=pad_id
+            data_iterator_val, validation_batches, batch_size, seq_len, pad_id=pad_id
         )
         del data_iterator_val
         if self.val_batch_data is not None:
+            print(
+                f"number of batches: {self.val_batch_data.batches} (expected: {validation_batches})."
+            )
             self.val_batch_data = self.val_batch_data.to(device)
+        else:
+            print("no data, not loaded.")
 
         self.step = self.state.step
+
+        self.statistics = self.state.statistics
 
         self.last_group_index = -1
 
@@ -684,8 +723,9 @@ def validate(
     model.load_state_dict(
         torch.load(model_state_path, weights_only=True, map_location=device)
     )
-    print("loaded.")
+    print("ok.")
 
+    print(f"Loading validation data ({dataset_name}_val.parquet)... ", end="")
     pf_val = ParquetFile(f"{dataset_name}_val.parquet")
     iterator_val = ParquetConcatIterator(pf_val, seq_len, pad_id=pad_id, sep_id=sep_id)
     val_batch_data = next_batches(
@@ -693,10 +733,10 @@ def validate(
     )
     del iterator_val
     if val_batch_data is None:
-        print("No data.")
+        print("no data, cannot do validation.")
         return
     else:
-        print(f"Number of batches: {val_batch_data.batches} (expected: {batches}).")
+        print(f"number of batches: {val_batch_data.batches} (expected: {batches}).")
         val_batch_data = val_batch_data.to(device)
 
     t_val_start = time.perf_counter()
@@ -805,14 +845,14 @@ def create_parser() -> ArgumentParser:
 
     # init
     init_parser = subparsers.add_parser("init")
-    init_parser.add_argument("pretrain_state_path")
-    init_parser.add_argument("model_state_path")
-    init_parser.add_argument("optimizer_state_path")
+    init_parser.add_argument("pretrain_state")
+    init_parser.add_argument("model_state")
+    init_parser.add_argument("optimizer_state")
 
     # generate
     gen_parser = subparsers.add_parser("generate")
-    gen_parser.add_argument("model_state_path")
-    gen_parser.add_argument("tokenizer_path")
+    gen_parser.add_argument("model_state")
+    gen_parser.add_argument("tokenizer")
     gen_parser.add_argument("seq_len", type=int, help="sequence length")
     gen_parser.add_argument("count", type=int, help="max generation count")
     gen_parser.add_argument("prompt")
@@ -826,9 +866,9 @@ def create_parser() -> ArgumentParser:
 
     # train
     train_parser = subparsers.add_parser("train")
-    train_parser.add_argument("pretrain_state_path")
-    train_parser.add_argument("model_state_path")
-    train_parser.add_argument("optimizer_state_path")
+    train_parser.add_argument("pretrain_state")
+    train_parser.add_argument("model_state")
+    train_parser.add_argument("optimizer_state")
     train_parser.add_argument("dataset_name")
     train_parser.add_argument("target_step", type=int)
     train_parser.add_argument(
@@ -844,7 +884,7 @@ def create_parser() -> ArgumentParser:
 
     # validate
     val_parser = subparsers.add_parser("validate")
-    val_parser.add_argument("model_state_path")
+    val_parser.add_argument("model_state")
     val_parser.add_argument("seq_len", type=int, help="sequence length")
     val_parser.add_argument("batch_size", type=int, help="batch size")
     val_parser.add_argument("dataset_name")
@@ -868,27 +908,26 @@ def cli(
 
     use_bf16 = not args.no_bf16
     print(f"Use BF16: {use_bf16}")
-    if use_bf16 and device != "cuda":
-        print("WARNING: device is not cuda, but BF16 autocast is enabled.")
+    warn_bf16(device, use_bf16)
 
     match args.action:
         case "init":
             state = PretrainState()
-            with open(args.pretrain_state_path, "w") as f:
+            with open(args.pretrain_state, "w") as f:
                 f.write(state.model_dump_json())
 
             model = Model(model_config)
-            torch.save(model.state_dict(), args.model_state_path)
+            torch.save(model.state_dict(), args.model_state)
 
             optimizer = AdamW(model.parameters())
-            torch.save(optimizer.state_dict(), args.optimizer_state_path)
+            torch.save(optimizer.state_dict(), args.optimizer_state)
 
             print("Initialization done.")
 
         case "generate":
             generate(
-                args.model_state_path,
-                args.tokenizer_path,
+                args.model_state,
+                args.tokenizer,
                 args.seq_len,
                 args.count,
                 args.prompt,
@@ -920,9 +959,9 @@ def cli(
                     batch_size,
                     args.dataset_name,
                     lr_func,
-                    args.pretrain_state_path,
-                    args.model_state_path,
-                    args.optimizer_state_path,
+                    args.pretrain_state,
+                    args.model_state,
+                    args.optimizer_state,
                     device=device,
                     pad_id=pad_id,
                     sep_id=sep_id,
@@ -933,8 +972,8 @@ def cli(
                 trainer.run(args.target_step)
 
         case "validate":
-            print(f"Sequence length: {seq_len}")
-            print(f"Batch size: {batch_size}")
+            print(f"Sequence length: {args.seq_len}")
+            print(f"Batch size: {args.batch_size}")
 
             validate(
                 model_config,
@@ -942,7 +981,7 @@ def cli(
                 args.batch_size,
                 args.dataset_name,
                 args.batches,
-                args.model_state_path,
+                args.model_state,
                 device=device,
                 pad_id=pad_id,
                 sep_id=sep_id,

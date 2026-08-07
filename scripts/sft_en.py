@@ -1,4 +1,4 @@
-from spargel_llm_pab.config import PAD, IM_START, IM_END, default_model_config
+from spargel_llm_pab.config import IM_END, IM_START, PAD, default_model_config
 from spargel_llm_pab.sft import cli
 
 if __name__ == "__main__":

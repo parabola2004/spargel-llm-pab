@@ -4,13 +4,9 @@ import socket
 from collections.abc import Callable, Iterator
 
 import torch
-from pyarrow.parquet import ParquetFile
-from pydantic import BaseModel
-from tokenizers import Tokenizer
 
 from spargel_llm.model import Config
 from spargel_llm.train.basic import Item, compile_batch_data
-from spargel_llm.train.sft import Message, build_sft_item_chatml
 
 # Learning rate scheduler
 
@@ -28,42 +24,29 @@ def cosine(x1: float, x2: float, y1: float, y2: float, x: float) -> float:
     return (y1 + y2) / 2 + A * math.cos(t * math.pi)
 
 
-def linear_warmup_cosine_decay(
-    max_lr: float, max_steps: int, warmup_steps: int = 100
+def linear_warmup_stable_cosine_decay(
+    max_lr: float, max_steps: int, warmup_steps: int = 100, decay_steps: int = 0
 ) -> LRFunc:
-    assert max_steps >= warmup_steps
+    assert warmup_steps + decay_steps <= max_steps
 
     def lr_func(step: int) -> float:
         if step < warmup_steps:
             return linear(0, warmup_steps, 0, max_lr, step)
-        elif step < max_steps:
-            return cosine(warmup_steps, max_steps, max_lr, 0, step)
         else:
-            return 0
+            if decay_steps > 0:
+                if step < max_steps - decay_steps:
+                    return max_lr
+                elif step < max_steps:
+                    return cosine(max_steps - decay_steps, max_steps, max_lr, 0, step)
+                else:
+                    return 0.0
+            else:
+                return max_lr
 
     return lr_func
 
 
 # State classes
-
-
-class PretrainDatasetState(BaseModel):
-    group_index: int = 0
-    offset: int = 0
-
-
-class PretrainState(BaseModel):
-    step: int = 0
-    dataset: dict[str, PretrainDatasetState] = {}
-
-
-class SFTDatasetState(BaseModel):
-    index: int = 0
-
-
-class SFTState(BaseModel):
-    step: int = 0
-    dataset: dict[str, SFTDatasetState] = {}
 
 
 def setup(
@@ -94,6 +77,11 @@ def setup(
         print(f"Using device: {device}")
 
     return device
+
+
+def warn_bf16(device: str, use_bf16: bool):
+    if use_bf16 and device != "cuda":
+        print("WARNING: device is not cuda, but BF16 autocast is enabled.")
 
 
 def next_batches(
@@ -153,71 +141,3 @@ def compute_param_counts(config: Config) -> tuple[int, int]:
     # Therefore neither contributes to the parameter count.
 
     return embedding_params, body_params
-
-
-class SFTDataIterator(Iterator[Item]):
-    def __init__(
-        self,
-        pf: ParquetFile,
-        tokenizer: Tokenizer,
-        seq_len: int,
-        index: int = 0,
-        *,
-        pad_id: int,
-        im_start_id: int,
-        im_end_id: int,
-        column_name: str = "messages",
-        role_key: str = "role",
-        content_key: str = "content",
-    ):
-        self.pf = pf
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.index = index
-        self.pad_id = pad_id
-        self.im_start_id = im_start_id
-        self.im_end_id = im_end_id
-        self.column_name = column_name
-        self.role_key = role_key
-        self.content_key = content_key
-
-        self._column = None
-        self._start = 0
-        self._end = 0
-
-    def __iter__(self) -> SFTDataIterator:
-        return self
-
-    def __next__(self) -> Item:
-        if self._column is None or self.index >= self._end:
-            offset = 0
-            for rg_idx in range(self.pf.metadata.num_row_groups):
-                rg_rows = self.pf.metadata.row_group(rg_idx).num_rows
-                if offset + rg_rows > self.index:
-                    table = self.pf.read_row_group(rg_idx, columns=[self.column_name])
-                    self._column = table.column(self.column_name).combine_chunks()
-                    self._start = offset
-                    self._end = offset + rg_rows
-                    break
-                offset += rg_rows
-            else:
-                raise StopIteration
-
-        local_idx = self.index - self._start
-        raw_messages = self._column[local_idx].as_py()
-        messages = [
-            Message(role=m[self.role_key], content=m[self.content_key])
-            for m in raw_messages
-        ]
-
-        item = build_sft_item_chatml(
-            messages,
-            self.tokenizer,
-            self.seq_len,
-            pad_id=self.pad_id,
-            im_start_id=self.im_start_id,
-            im_end_id=self.im_end_id,
-        )
-
-        self.index += 1
-        return item

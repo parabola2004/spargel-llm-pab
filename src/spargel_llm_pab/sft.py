@@ -1,28 +1,133 @@
+from __future__ import annotations
+
 import time
 from argparse import ArgumentParser
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, override
 
 import torch
-from torch.optim import AdamW
 from pyarrow.parquet import ParquetFile
+from pydantic import BaseModel, Field
 from tokenizers import Tokenizer
+from torch.optim import AdamW
 
 from spargel_llm.model import Config, Model
-from spargel_llm.train.basic import compute_validation_metrics
+from spargel_llm.train.basic import Item, compute_validation_metrics
+from spargel_llm.train.sft import Message, build_sft_item_chatml
 
-from .pretrain import PretrainerBase, estimate_memory, report_memory_estimate
-from .utils import (
-    LRFunc,
-    SFTState,
-    SFTDatasetState,
-    SFTDataIterator,
-    next_batches,
-    setup,
+from .pretrain import (
+    PretrainerBase,
+    PretrainStatistics,
+    estimate_memory,
+    report_memory_estimate,
 )
+from .utils import LRFunc, next_batches, setup, warn_bf16
 
 
-class SFTTrainer(PretrainerBase):
+class SFTDatasetState(BaseModel):
+    index: int = 0
+
+
+class SFTState(BaseModel):
+    step: int = 0
+    dataset: dict[str, SFTDatasetState] = {}
+    statistics: PretrainStatistics = PretrainStatistics()
+
+
+class SFTDataIterator(Iterator[Item]):
+    def __init__(
+        self,
+        pf: ParquetFile,
+        tokenizer: Tokenizer,
+        seq_len: int,
+        index: int = 0,
+        *,
+        pad_id: int,
+        im_start_id: int,
+        im_end_id: int,
+        column_name: str = "messages",
+        role_key: str = "role",
+        content_key: str = "content",
+    ):
+        self.pf = pf
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.index = index
+        self.pad_id = pad_id
+        self.im_start_id = im_start_id
+        self.im_end_id = im_end_id
+        self.column_name = column_name
+        self.role_key = role_key
+        self.content_key = content_key
+
+        self._column = None
+        self._start = 0
+        self._end = 0
+
+    def __iter__(self) -> SFTDataIterator:
+        return self
+
+    def __next__(self) -> Item:
+        if self._column is None or self.index >= self._end:
+            offset = 0
+            for rg_idx in range(self.pf.metadata.num_row_groups):
+                rg_rows = self.pf.metadata.row_group(rg_idx).num_rows
+                if offset + rg_rows > self.index:
+                    table = self.pf.read_row_group(rg_idx, columns=[self.column_name])
+                    self._column = table.column(self.column_name).combine_chunks()
+                    self._start = offset
+                    self._end = offset + rg_rows
+                    break
+                offset += rg_rows
+            else:
+                raise StopIteration
+
+        local_idx = self.index - self._start
+        raw_messages = self._column[local_idx].as_py()
+        messages = [
+            Message(role=m[self.role_key], content=m[self.content_key])
+            for m in raw_messages
+        ]
+
+        item = build_sft_item_chatml(
+            messages,
+            self.tokenizer,
+            self.seq_len,
+            pad_id=self.pad_id,
+            im_start_id=self.im_start_id,
+            im_end_id=self.im_end_id,
+        )
+
+        self.index += 1
+        return item
+
+
+# Dataset utils
+
+
+class ShareGPTMessage(BaseModel):
+    from_: str = Field(alias="from")
+    value: str
+
+
+class ShareGPTConversation(BaseModel):
+    """ShareGPT Stype"""
+
+    conversations: list[ShareGPTMessage]
+
+
+SHAREGPT_ROLE_MAPPING = {"system": "system", "human": "user", "gpt": "assistant"}
+
+
+def from_sharegpt(conversation: ShareGPTConversation) -> list[Message]:
+    messages: list[Message] = []
+    for message_orig in conversation.conversations:
+        role = SHAREGPT_ROLE_MAPPING.get(message_orig.from_, message_orig.from_)
+        messages.append(Message(role=role, content=message_orig.value))
+    return messages
+
+
+class SFTuner(PretrainerBase):
     def __init__(
         self,
         model_config: Config,
@@ -41,6 +146,7 @@ class SFTTrainer(PretrainerBase):
         im_end_id: int,
         use_bf16: bool = True,
         tensorboard_dir: str | None = None,
+        validation_batches: int = 10,
         log_period: int = 100,
         save_period: int = 1000,
         checkpoint_period: int = 4000,
@@ -59,6 +165,7 @@ class SFTTrainer(PretrainerBase):
         print("loaded.")
 
         # Prepare training data
+        print(f"Loading training dataset ({dataset_name}.parquet)... ", end="")
         pf_train = ParquetFile(f"{dataset_name}.parquet")
         data_iterator_train = SFTDataIterator(
             pf_train,
@@ -69,6 +176,7 @@ class SFTTrainer(PretrainerBase):
             im_start_id=im_start_id,
             im_end_id=im_end_id,
         )
+        print("ok.")
 
         super().__init__(
             model_config,
@@ -91,24 +199,31 @@ class SFTTrainer(PretrainerBase):
         self.data_iterator = data_iterator_train
 
         # Prepare validation data
+        print(f"Loading validation data ({dataset_name}_val.parquet)... ", end="")
         pf_val = ParquetFile(f"{dataset_name}_val.parquet")
         data_iterator_val = SFTDataIterator(
             pf_val,
             self.tokenizer,
             seq_len,
-            self.dataset_state.index,
             pad_id=pad_id,
             im_start_id=im_start_id,
             im_end_id=im_end_id,
         )
         self.val_batch_data = next_batches(
-            data_iterator_val, 10, batch_size, seq_len, pad_id=pad_id
+            data_iterator_val, validation_batches, batch_size, seq_len, pad_id=pad_id
         )
         del data_iterator_val
         if self.val_batch_data is not None:
+            print(
+                f"number of batches: {self.val_batch_data.batches} (expected: {validation_batches})."
+            )
             self.val_batch_data = self.val_batch_data.to(device)
+        else:
+            print("no data, not loaded.")
 
         self.step = self.state.step
+
+        self.statistics = self.state.statistics
 
     @override
     def run(self, target_step: int):
@@ -179,6 +294,7 @@ def validate(
     tokenizer = Tokenizer.from_file(tokenizer_path)
     print("loaded.")
 
+    print(f"Loading validation data ({dataset_name}_val.parquet)... ", end="")
     pf_val = ParquetFile(f"{dataset_name}_val.parquet")
     iterator_val = SFTDataIterator(
         pf_val,
@@ -193,10 +309,10 @@ def validate(
     )
     del iterator_val
     if val_batch_data is None:
-        print("No data.")
+        print("no data, cannot do validation.")
         return
     else:
-        print(f"Number of batches: {val_batch_data.batches} (expected: {batches}).")
+        print(f"number of batches: {val_batch_data.batches} (expected: {batches}).")
         val_batch_data = val_batch_data.to(device)
 
     t_val_start = time.perf_counter()
@@ -235,15 +351,15 @@ def create_parser() -> ArgumentParser:
 
     # init
     init_parser = subparsers.add_parser("init")
-    init_parser.add_argument("sft_state_path")
-    init_parser.add_argument("optimizer_state_path")
+    init_parser.add_argument("sft_state")
+    init_parser.add_argument("optimizer_state")
 
     # train
     train_parser = subparsers.add_parser("train")
-    train_parser.add_argument("sft_state_path")
-    train_parser.add_argument("model_state_path")
-    train_parser.add_argument("optimizer_state_path")
-    train_parser.add_argument("tokenizer_path")
+    train_parser.add_argument("sft_state")
+    train_parser.add_argument("model_state")
+    train_parser.add_argument("optimizer_state")
+    train_parser.add_argument("tokenizer")
     train_parser.add_argument("dataset_name")
     train_parser.add_argument("target_step", type=int)
     train_parser.add_argument(
@@ -258,8 +374,8 @@ def create_parser() -> ArgumentParser:
 
     # validate
     val_parser = subparsers.add_parser("validate")
-    val_parser.add_argument("model_state_path")
-    val_parser.add_argument("tokenizer_path")
+    val_parser.add_argument("model_state")
+    val_parser.add_argument("tokenizer")
     val_parser.add_argument("seq_len", type=int, help="sequence length")
     val_parser.add_argument("batch_size", type=int, help="batch size")
     val_parser.add_argument("dataset_name")
@@ -284,18 +400,17 @@ def cli(
 
     use_bf16 = not args.no_bf16
     print(f"Use BF16: {use_bf16}")
-    if use_bf16 and device != "cuda":
-        print("WARNING: device is not cuda, but BF16 autocast is enabled.")
+    warn_bf16(device, use_bf16)
 
     match args.action:
         case "init":
             state = SFTState()
-            with open(args.sft_state_path, "w") as f:
+            with open(args.sft_state, "w") as f:
                 f.write(state.model_dump_json())
 
             model = Model(model_config)
             optimizer = AdamW(model.parameters())
-            torch.save(optimizer.state_dict(), args.optimizer_state_path)
+            torch.save(optimizer.state_dict(), args.optimizer_state)
 
             print("Initialization done.")
 
@@ -314,16 +429,16 @@ def cli(
                     result, seq_len=seq_len, batch_size=batch_size, use_bf16=use_bf16
                 )
             else:
-                trainer = SFTTrainer(
+                trainer = SFTuner(
                     model_config,
                     seq_len,
                     batch_size,
                     args.dataset_name,
                     lr_func,
-                    args.sft_state_path,
-                    args.model_state_path,
-                    args.optimizer_state_path,
-                    args.tokenizer_path,
+                    args.sft_state,
+                    args.model_state,
+                    args.optimizer_state,
+                    args.tokenizer,
                     device=device,
                     pad_id=pad_id,
                     im_start_id=im_start_id,
@@ -334,8 +449,8 @@ def cli(
                 trainer.run(args.target_step)
 
         case "validate":
-            print(f"Sequence length: {seq_len}")
-            print(f"Batch size: {batch_size}")
+            print(f"Sequence length: {args.seq_len}")
+            print(f"Batch size: {args.batch_size}")
 
             validate(
                 model_config,
@@ -343,8 +458,8 @@ def cli(
                 args.batch_size,
                 args.dataset_name,
                 args.batches,
-                args.model_state_path,
-                args.tokenizer_path,
+                args.model_state,
+                args.tokenizer,
                 device=device,
                 pad_id=pad_id,
                 im_start_id=im_start_id,
