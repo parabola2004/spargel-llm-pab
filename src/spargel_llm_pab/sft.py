@@ -158,11 +158,11 @@ class SFTuner(PretrainerBase):
         with open(sft_state_path, "r") as f:
             self.state = SFTState.model_validate_json(f.read())
         self.dataset_state = self.state.dataset.get(dataset_name, SFTDatasetState())
-        print("loaded.")
+        print("ok.")
 
         print(f"Loading tokenizer ({tokenizer_path})... ", end="")
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
-        print("loaded.")
+        print("ok.")
 
         # Prepare training data
         print(f"Loading training dataset ({dataset_name}.parquet)... ", end="")
@@ -288,11 +288,11 @@ def validate(
     model.load_state_dict(
         torch.load(model_state_path, weights_only=True, map_location=device)
     )
-    print("loaded.")
+    print("ok.")
 
     print(f"Loading tokenizer ({tokenizer_path})... ", end="")
     tokenizer = Tokenizer.from_file(tokenizer_path)
-    print("loaded.")
+    print("ok.")
 
     print(f"Loading validation data ({dataset_name}_val.parquet)... ", end="")
     pf_val = ParquetFile(f"{dataset_name}_val.parquet")
@@ -329,9 +329,9 @@ def validate(
     print(f"val_ppl  = {val_perplexity:.4f}")
     print(f"val_time = {val_time:.4f}")
 
-    mask_true = val_batch_data.mask.sum().item()
-    mask_total = val_batch_data.mask.numel()
-    print(f"mask_ratio = {mask_true / mask_total:.4f}")
+    num_tokens_valid = val_batch_data.mask.sum().item()
+    num_tokens_all = val_batch_data.mask.numel()
+    print(f"valid_ratio = {num_tokens_valid / num_tokens_all:.4f}")
 
 
 # CLI
@@ -363,7 +363,7 @@ def create_parser() -> ArgumentParser:
     train_parser.add_argument("dataset_name")
     train_parser.add_argument("target_step", type=int)
     train_parser.add_argument(
-        "--tensorboard-dir", "-tb", help="TensorBoard write directory"
+        "--tensorboard-dir", "-tb", required=True, help="TensorBoard write directory"
     )
     train_parser.add_argument(
         "--estimate",

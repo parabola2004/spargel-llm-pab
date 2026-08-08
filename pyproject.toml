@@ -3,7 +3,10 @@ name = "spargel-llm-pab"
 version = "0.1.0"
 requires-python = ">=3.14"
 
-dependencies = ["spargel-llm[cpu]>=0.14.0"]
+dependencies = [
+    "spargel-llm[cpu]>=0.15.0",
+    "tensorboard>=2.21.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.1,<0.13"]

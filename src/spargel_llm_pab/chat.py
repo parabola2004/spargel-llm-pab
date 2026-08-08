@@ -75,7 +75,10 @@ def chat(
     while True:
         try:
             user_message = input("user > ")
-        except (EOFError, KeyboardInterrupt):
+        except KeyboardInterrupt:
+            print()
+            continue
+        except EOFError:
             print()
             break
 

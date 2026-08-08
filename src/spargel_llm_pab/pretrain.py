@@ -28,9 +28,16 @@ from spargel_llm.train.basic import (
     train_step,
 )
 from spargel_llm.train.pretrain import ParquetConcatIterator
-from spargel_llm.utils import format_bytes, format_flops
 
-from .utils import LRFunc, compute_param_counts, next_batches, setup, warn_bf16
+from .utils import (
+    LRFunc,
+    compute_param_counts,
+    format_bytes,
+    format_flops,
+    next_batches,
+    setup,
+    warn_bf16,
+)
 
 
 # also used in SFT
@@ -753,9 +760,9 @@ def validate(
     print(f"val_ppl  = {val_perplexity:.4f}")
     print(f"val_time = {val_time:.4f}")
 
-    mask_true = val_batch_data.mask.sum().item()
-    mask_total = val_batch_data.mask.numel()
-    print(f"mask_ratio = {mask_true / mask_total:.4f}")
+    num_tokens_valid = val_batch_data.mask.sum().item()
+    num_tokens_all = val_batch_data.mask.numel()
+    print(f"valid_ratio = {num_tokens_valid / num_tokens_all:.4f}")
 
 
 @torch.compile
@@ -872,7 +879,7 @@ def create_parser() -> ArgumentParser:
     train_parser.add_argument("dataset_name")
     train_parser.add_argument("target_step", type=int)
     train_parser.add_argument(
-        "--tensorboard-dir", "-tb", help="TensorBoard write directory"
+        "--tensorboard-dir", "-tb", required=True, help="TensorBoard write directory"
     )
     train_parser.add_argument("--loop-dataset", "-ld", default=True)
     train_parser.add_argument(

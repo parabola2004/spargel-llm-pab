@@ -6,7 +6,7 @@ if __name__ == "__main__":
         default_model_config(),
         seq_len=1024,
         batch_size=16,
-        lr_func=lambda _step: 1e-4,
+        lr_func=lambda _step: 3e-4,
         pad_id=PAD,
         im_start_id=IM_START,
         im_end_id=IM_END,
